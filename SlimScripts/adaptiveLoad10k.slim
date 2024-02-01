@@ -1,0 +1,292 @@
+function (void)finishSim(void){
+	//write final output
+	writeFile(
+		finalOut,
+		paste(finalOutRows(), sep = "\n"),
+		append = T);
+
+	//end the simulation
+	sim.simulationFinished();
+}
+
+//INITIALIZE
+initialize() {
+	initializeSLiMModelType("nonWF");
+	
+	if(!exists("replicate"))
+		defineConstant("replicate", 0);	
+	
+	/* 			define constants 			*/	
+	
+	//mutation rate modifier
+	//mutMod = 10;
+	if(!exists("mutMod"))
+		defineConstant("mutMod", 1);
+	
+	//whether new generation competes with a random other child (T)
+	//or a littermate (F)
+	if(!exists("randPairs"))
+		defineConstant("randPairs", F);
+	
+	//number of litters produced each generation
+	if (!exists("N"))
+		defineConstant("N", 10000);
+	//selfing rate
+	if(!exists("selfR"))
+		defineConstant("selfR", 0.25);
+	//inbreeding depression
+	if(!exists("inD"))
+		defineConstant("inD", 1); //1 >0.5
+	//selection coefficient of recessive muts
+	if(!exists("selecR"))
+		defineConstant("selecR", -1); //1
+	//genome length
+	if(!exists("genomeL"))
+		defineConstant("genomeL", 100000);
+	//number of chromosomes; must be 2+
+	if(!exists("numChr"))
+		defineConstant("numChr", 10);
+	
+	//output files
+	if(!exists("simInfoOut"))
+		defineConstant("simInfoOut", "adapLoadTestSim.csv");
+	if(!exists("generationsOut"))
+		defineConstant("generationsOut", "adapLoadGens.csv");
+	if(!exists("finalOut"))
+		defineConstant("finalOut", "adapLoadFinal.csv");
+	
+	/* 				intialize 				*/
+	
+	// initialize recessive mutations
+	initializeMutationType("m1", 0.0, "f", selecR);
+	m1.convertToSubstitution = F;
+	
+	// initialize genome
+	initializeGenomicElementType("g1", m1, 1.0);
+	
+	initializeGenomicElement(g1, 0, genomeL - 1);
+		
+	//calculate recombination breaks & rates
+	//to get the right number of chromosomes & make them a morgan long
+	
+	chrBreaks = asInteger(seq(0, genomeL - 1, length = numChr + 1));
+	chrLength = chrBreaks[1];
+	normalRecomRate = (chrLength) ^ -1;
+	//normalRecomRate = 1e-9; //useful for viewing the chromosome breaks in SLiMgui
+										//otherwise the recom. rate is too high to see them
+	
+	//create recombination breakpoints for each chromosome
+	chrBreaksEnd = chrBreaks + 1;
+	recomBreaks = sapply(1:(numChr - 1), "c(chrBreaks[applyValue], chrBreaksEnd[applyValue]);");
+	recomRates = sapply(1:(numChr - 1), "c(normalRecomRate, 0.5);");
+	
+	initializeRecombinationRate(c(recomRates, normalRecomRate), c(recomBreaks, genomeL - 1));
+	
+	//calculate mutation rate
+	//so can expect one new mutation per individual
+	mutRate = (genomeL * 2 * mutMod) ^ -1;
+	initializeMutationRate(mutRate);
+	
+	//define some globals
+	defineGlobal("mutFreq200", rep(-1.0, 200));
+}
+
+reproduction() {
+	//sample all parents; parents may have a litter multiple times
+	parents = sample(p1.individuals, N, T);
+
+	//initialize vector of new generation
+	//first two are of the same litter, next two are of the same litter, etc.
+	offspring = rep(p1.individuals[0], N * 2);
+
+	//randomly determine whether selfing occurs for each child
+	selfing = sample(c(T, F), 2 * N, T, weights = c(selfR, 1 - selfR));
+
+	//generate N litters
+	for (i in seq(0, N - 1)){
+		par1 = parents[i];
+
+		//each litter is made of 2 children
+		for (j in seq(0,1)){
+			//check if it's produced by selfing or not
+			if(selfing[2 * i + j]){
+				//self
+				offspring[2 * i + j] = p1.addSelfed(par1);
+				//tag child as a product of selfing
+				offspring[2 * i + j].tag = 1;
+			}
+			else{
+				//select other mate
+				do par2 = sample(p1.individuals, 1);
+				while(par2 == par1);
+				
+				//mate
+				offspring[2 * i + j] = p1.addCrossed(par1, par2);
+				//tag child as a product of outcrossing
+				offspring[2 * i + j].tag = 0;
+			}
+			
+			//determine if the child will die from its own mutations
+			//get all homozygous mutations
+			homoMuts = setIntersection(offspring[2 * i + j].genome1.mutations, 
+												offspring[2 * i + j].genome2.mutations);
+												
+			//fitness effects of the mutations are multiplicative
+			fit = product(1.0 + homoMuts.selectionCoeff);
+
+			//kill the child based on fitness
+			offspring[2 * i + j].fitnessScaling = sample(c(1.0, 0.0), 1, weights = c(fit, 1.0 - fit));
+		}
+
+	} //end loop through parents
+	
+	//if using random pairs, shuffle the offspring
+	if(randPairs){
+		offspring = sample(offspring, length(offspring));
+	}
+	//otherwise, they are ordered by litter
+	
+	//loop through offspring
+	for (k in seq(0, N - 1)){		
+		pair = offspring[(2 * k):(2 * k + 1)];
+		
+		//if they're both alive
+		if(pair[0].fitnessScaling & pair[1].fitnessScaling){
+			//kill random child
+			sample(pair, 1).fitnessScaling = 0.0;
+		}
+	}
+	
+	//print(sum(offspring.fitnessScaling));
+	
+	// disable this callback for this generation
+	self.active = 0;
+}
+
+//fitness calls
+fitness(m1){
+	//because m1 mutations act in childhood, before fitness() is called
+	//they do not affect the formal fitness calculation of each individual
+	return 1.0;
+}
+
+fitness(NULL){
+	//adjust fitness for inbreeding depression
+	return (1.0 - (individual.tag * inD));
+}
+
+//intitialize population
+1 {
+	sim.addSubpop(1, N);
+	//none of the first generation are selfed
+	p1.individuals.tag = 0;
+	
+	//write to simInfoOut file
+	simInfo = paste(c(replicate, mutMod, randPairs, N, selfR, inD, selecR, genomeL, numChr), sep = ",");
+	writeFile(
+		simInfoOut,
+		simInfo,
+		append = T);
+}
+
+//adjust fitnessScaling for age
+early() {
+	//kill adults to prevent overlapping generations
+	p1.individuals[p1.individuals.age >= 1].fitnessScaling = 0.0;
+	
+	//NOTE: adjusting for carrying capacity has been commented out
+	//but it can be re-introduced	
+	/*
+	//first only consider individuals who aren't meant to die yet
+	adjustedPopSize = sum(p1.individuals.fitnessScaling); //works because fitnessScaling is
+																			//either 0 or 1 in this script
+	//then adjust survival for carrying capacity, K
+	p1.fitnessScaling = K / adjustedPopSize;
+	*/
+}
+
+late() {
+	//record the average mut freq in mutFreq200	
+	i = (sim.generation - 1) % 200;
+	
+	if(length(sim.mutations) == 0) avgMutFreq = 0;
+	else avgMutFreq = mean(sim.mutationFrequencies(p1));	
+	
+	mutFreq200[i] = avgMutFreq;
+	
+	//compare the last 100 generations to the 100 generations before that
+	//every 100 generations
+	if((sim.generation >= 199) & (sim.generation % 100 == 0)){
+		//calculate current (most recent 100) average and past (100 before) average
+		if(i > 100){
+			currAvg = mean(mutFreq200[100:199]);
+			pastAvg = mean(mutFreq200[0:99]);
+		}
+		else{
+			currAvg = mean(mutFreq200[0:99]);
+			pastAvg = mean(mutFreq200[100:199]);
+		}
+		
+		//if the difference in averages is at most 0.1% of the past average
+		//finish
+		dif = abs(currAvg - pastAvg);
+		perDif = dif / pastAvg;
+		
+		print(paste(c(sim.generation, "- pastAvg:", pastAvg, "currAvg:", currAvg, "perDif:", perDif)));		
+		
+		if(perDif <= 0.001){
+			finishSim();
+		}
+	}
+	
+}
+
+function (string)finalOutRows(void){
+	//get mutation frequencies
+	freqs = sim.mutationFrequencies(p1);
+	
+	//format into a vector of strings
+	//each a row of a CSV file that lists: 
+	//simulation replicate, simulation generation, mutation frequency
+	//for each mutation
+	return sapply(freqs, "paste(c(replicate, sim.generation, applyValue), sep = ',');");
+}
+
+function (string)generationOutRows(void){
+	//replicate, simulation generation, total mutations in the simulation,
+	//number of individuals, mean # mutations per individual,
+	//mean mutation frequency
+	if(length(sim.mutations) == 0) avgMutFreq = 0;
+	else avgMutFreq = mean(sim.mutationFrequencies(p1));
+	return paste(c(replicate,
+						sim.generation,
+						sim.countOfMutationsOfType(m1),
+						p1.individualCount,
+						mean(p1.individuals.countOfMutationsOfType(m1)),
+						//mean(sim.mutationFrequencies(p1))
+						avgMutFreq
+						),
+			sep = ",");
+}
+
+1 late() {
+	writeFile(
+		generationsOut,
+		paste(generationOutRows(), sep = "\n"),
+		append = T);
+}
+
+
+late() {
+	//write output if the generation is a multiple of 10
+	if(sim.generation % 10 == 0){
+		writeFile(
+			generationsOut,
+			paste(generationOutRows(), sep = "\n"),
+			append = T);
+	}
+}
+
+10000 late() {
+	finishSim();
+}
